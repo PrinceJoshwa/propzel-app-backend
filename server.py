@@ -70,8 +70,51 @@ async def get_status_checks():
 # through a readable `X-Session-Cookie` header instead of Set-Cookie, so the
 # app works identically on web preview and on-device. No CRM logic is
 # reimplemented here.
-CRM_BASE = "https://taskko-crm-server.vercel.app/api"
+CRM_BASE = os.environ.get(
+    "CRM_BASE_URL",
+    "https://taskko-crm-server.vercel.app/api",
+).rstrip("/")
 _HOP_HEADERS = {"content-length", "host", "connection", "accept-encoding"}
+
+
+async def _forward_public_crm_event(path: str, request: Request) -> Response:
+    """Forward provider callbacks without requiring a user CRM session."""
+    body = await request.body()
+    headers = {}
+    for name in ("content-type", "x-callerdesk-secret", "x-webhook-secret"):
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as cx:
+            upstream = await cx.request(
+                request.method,
+                f"{CRM_BASE}/{path.lstrip('/')}",
+                content=body if body else None,
+                headers=headers,
+            )
+    except httpx.RequestError as exc:
+        logger.error("Public CRM event proxy error: %s", exc)
+        return Response(
+            content=b'{"detail":"Upstream CRM event request failed"}',
+            status_code=502,
+            media_type="application/json",
+        )
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "application/json"),
+    )
+
+
+@api_router.post("/callerdesk/webhook")
+async def callerdesk_webhook(request: Request):
+    """Public Caller Desk callback URL for the deployed Propzel backend.
+
+    The Taskko CRM service owns the Caller Desk database automation; this
+    public bridge keeps the provider independent of browser sessions.
+    """
+    return await _forward_public_crm_event("callerdesk/webhook", request)
 
 
 @api_router.api_route(
